@@ -28,23 +28,48 @@ func NewHarness() (*Harness, error) {
 	if err != nil {
 		return nil, err
 	}
-	repo, err := storage.NewRepository(tempDir)
-	if err != nil {
+	harness := &Harness{
+		client:  &http.Client{Timeout: 45 * time.Second},
+		tempDir: tempDir,
+	}
+	if err := harness.start(context.Background()); err != nil {
 		_ = os.RemoveAll(tempDir)
 		return nil, err
 	}
+	return harness, nil
+}
+
+// start builds the repository, service, and HTTP stack on the harness data
+// directory. Startup render recovery runs before the server accepts requests,
+// mirroring the production entry point.
+func (harness *Harness) start(ctx context.Context) error {
+	repo, err := storage.NewRepository(harness.tempDir)
+	if err != nil {
+		return err
+	}
 	serviceLayer := service.New(repo, service.DefaultConfig())
+	if err := serviceLayer.RecoverRenders(ctx); err != nil {
+		return err
+	}
 	httpServer := httpapi.New(serviceLayer, httpapi.Options{
 		MaxSourceRequestBytes: 48 << 20,
 		MaxJSONBytes:          2 << 20,
 	})
-	server := httptest.NewServer(httpServer.Handler())
-	return &Harness{
-		baseURL: server.URL,
-		client:  &http.Client{Timeout: 45 * time.Second},
-		tempDir: tempDir,
-		server:  server,
-	}, nil
+	harness.server = httptest.NewServer(httpServer.Handler())
+	harness.baseURL = harness.server.URL
+	return nil
+}
+
+// restart simulates a service restart over the same data directory.
+func (harness *Harness) restart(ctx context.Context) error {
+	harness.server.Close()
+	return harness.start(ctx)
+}
+
+// repository opens an independent repository handle on the harness data
+// directory for controlled fault injection.
+func (harness *Harness) repository() (*storage.Repository, error) {
+	return storage.NewRepository(harness.tempDir)
 }
 
 func (harness *Harness) Close() {

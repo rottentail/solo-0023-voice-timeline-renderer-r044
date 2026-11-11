@@ -5,6 +5,15 @@ import (
 	"fmt"
 )
 
+// Control-flow sentinels describing committed render artifacts on disk.
+var (
+	// ErrRenderArtifactsAbsent reports that no artifact directory exists for a render.
+	ErrRenderArtifactsAbsent = errors.New("render artifacts are absent")
+	// ErrRenderArtifactsUnowned reports that on-disk files cannot prove they
+	// belong to the render job and therefore must not be treated as its output.
+	ErrRenderArtifactsUnowned = errors.New("render artifacts cannot prove ownership")
+)
+
 // ErrorKind maps domain failures to transport-neutral categories.
 type ErrorKind string
 

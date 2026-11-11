@@ -2,7 +2,12 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"os"
 	"sync"
+	"time"
 
 	"voice-timeline-renderer/internal/domain"
 )
@@ -15,14 +20,26 @@ type Repository interface {
 	GetTimeline(string) (domain.Timeline, error)
 	SaveJob(domain.RenderJob) error
 	GetJob(string) (domain.RenderJob, error)
+	ListRenderJobs() ([]domain.RenderJob, error)
 	CommitRenderArtifacts(string, []byte, domain.RenderReceipt) error
 	GetRenderOutput(string) ([]byte, domain.RenderReceipt, error)
+	LoadOwnedRenderArtifacts(string, string) ([]byte, domain.RenderReceipt, error)
+	QuarantineRenderArtifacts(string) error
+	CleanStaging() error
+	// AcquireRenderLease returns a release function when the caller becomes
+	// the executor for the render job; the release must be called once the
+	// job reaches a terminal state.
+	AcquireRenderLease(string, string, time.Duration, bool) (func() error, bool, error)
 }
 
 type Config struct {
 	MaxSourceBytes  int64
 	MaxSpans        int
 	MaxOutputFrames int64
+	// RenderLeaseTTL bounds how long an executor may hold the publish
+	// qualification for one render before a crashed executor's lease becomes
+	// reclaimable.
+	RenderLeaseTTL time.Duration
 }
 
 func DefaultConfig() Config {
@@ -30,13 +47,15 @@ func DefaultConfig() Config {
 		MaxSourceBytes:  32 << 20,
 		MaxSpans:        64,
 		MaxOutputFrames: 48000 * 180,
+		RenderLeaseTTL:  2 * time.Minute,
 	}
 }
 
 type Service struct {
-	repo   Repository
-	config Config
-	mu     sync.Mutex
+	repo     Repository
+	config   Config
+	executor string
+	mu       sync.Mutex
 }
 
 func New(repo Repository, config Config) *Service {
@@ -50,7 +69,20 @@ func New(repo Repository, config Config) *Service {
 	if config.MaxOutputFrames <= 0 {
 		config.MaxOutputFrames = defaults.MaxOutputFrames
 	}
-	return &Service{repo: repo, config: config}
+	if config.RenderLeaseTTL <= 0 {
+		config.RenderLeaseTTL = defaults.RenderLeaseTTL
+	}
+	return &Service{repo: repo, config: config, executor: newExecutorToken()}
+}
+
+// newExecutorToken distinguishes this service instance from any other
+// executor that shares the same data directory.
+func newExecutorToken() string {
+	var random [8]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return fmt.Sprintf("pid-%d", os.Getpid())
+	}
+	return fmt.Sprintf("pid-%d-%s", os.Getpid(), hex.EncodeToString(random[:]))
 }
 
 type SourceWriteRequest struct {

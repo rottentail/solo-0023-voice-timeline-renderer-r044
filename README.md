@@ -134,6 +134,32 @@ The render runs through the durable states
 terminal `failed` state with a stable error code and does not expose a partial
 output folder.
 
+### Recover interrupted renders
+
+A render job is durable, so an interrupted process can leave one behind in an
+active state. Recovery is built into both entry points and always keeps the
+original render identifier:
+
+- At startup the service resumes every non-terminal job before it accepts
+  requests.
+- Repeating `PUT /v1/renders/{render_id}` for a non-terminal job resumes it
+  instead of replaying the stale record.
+
+Resumption first inspects the committed artifact folder. When the receipt
+names this render and timeline and the output bytes match the receipt digest,
+the artifacts are adopted and the job is marked completed without re-mixing.
+Files that cannot prove they belong to the job are moved to a quarantine
+folder under `tmp/` and the job is executed again. Every resumption ends in an
+explainable terminal state: `completed`, or `failed` with the stable error
+code that caused it.
+
+Publishing is single-writer: an executor lease (`jobs/<render_id>.lock`)
+ensures that recovery and a concurrent same-identifier request cannot publish
+at the same time. A request that arrives while another executor holds the
+lease receives the current job state and can poll until it turns terminal.
+Leases expire and are reclaimed atomically, so a crashed executor cannot
+block a render forever.
+
 ### Read resources
 
 - `GET /v1/sources/{source_id}`
@@ -155,6 +181,7 @@ var/voice-timeline/
     metadata.json
   timelines/<timeline_id>.json
   jobs/<render_id>.json
+  jobs/<render_id>.lock
   renders/<render_id>/
     output.wav
     receipt.json
@@ -163,7 +190,10 @@ var/voice-timeline/
 
 Source and render folders are assembled in `tmp/` and moved into place with one
 directory rename. Metadata updates use same-directory temporary files followed
-by rename.
+by rename. The job lock file is the executor lease described above; it is
+removed when the job turns terminal. Render artifact folders that fail
+ownership verification are quarantined under `tmp/quarantine-*`, and leftover
+staging folders are cleaned during startup recovery.
 
 ## Source layout
 
@@ -187,10 +217,13 @@ Run each declared production check from the repository root:
 go run ./cmd/timelinecheck -workflow ingest-audio-source
 go run ./cmd/timelinecheck -workflow compose-timeline
 go run ./cmd/timelinecheck -workflow render-mixdown
+go run ./cmd/timelinecheck -workflow recover-interrupted-render
 ```
 
 Each check creates an isolated temporary data directory, starts the real HTTP
-handler, sends generated WAV inputs, and verifies read-back or rendered output.
+handler, sends generated WAV inputs, and verifies read-back or rendered
+output. The recovery check additionally restarts the service stack over the
+same data directory to confirm interrupted renders reach a terminal state.
 The checks are bounded and do not require network access.
 
 ## Deferred test boundary

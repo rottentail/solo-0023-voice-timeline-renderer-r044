@@ -69,6 +69,14 @@ Any active state may transition to `failed`. `completed` and `failed` are
 terminal. A failed job stores a stable error code and message. A completed job
 stores the output file, output metadata, and immutable render receipt.
 
+A job left in an active state by an interrupted process is resumed under its
+original identifier, either by startup recovery or by repeating the render
+request. Resumption adopts committed artifacts that prove ownership (receipt
+identity plus output digest) instead of re-mixing, quarantines files that
+cannot prove ownership, and always ends in an explainable terminal state. An
+executor lease per render identifier guarantees that only one executor may
+publish the result when resumption and a same-identifier request overlap.
+
 ### Render receipt
 
 A receipt records source identifiers, span placement, gain adjustments, peak
@@ -121,6 +129,15 @@ Entry point: `PUT /v1/renders/{render_id}` with a `timeline_id` body field.
 
 Success is observable through the job resource, the downloaded WAV, and the
 receipt. Failure is observable through the terminal job error code.
+
+Repeating the request with the same render identifier resumes a job that was
+left in an active state (for example after a service restart) instead of
+replaying the stale record. If the artifact folder already contains a receipt
+naming this render and timeline and output bytes matching the receipt digest,
+the job adopts those artifacts and completes without re-mixing; otherwise
+unverifiable files are quarantined and the job is executed again. An executor
+lease per render identifier keeps publication single-writer when resumption
+races a same-identifier request.
 
 ## HTTP interface
 
@@ -176,6 +193,10 @@ The runtime manifest exposes one bounded production smoke path per workflow:
   fails.
 - Render a crossfaded timeline, download the output, decode it, and match core
   receipt measurements.
+- Interrupt renders into each active state, restart the service over the same
+  data directory, and confirm owned artifacts are adopted, unverifiable files
+  are quarantined and re-rendered, and a held executor lease blocks a
+  concurrent same-identifier request.
 
 These checks use the real HTTP entry points and local storage. They are not a
 replacement for the test suite that the later task stage will add.

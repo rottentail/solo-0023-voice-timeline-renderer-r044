@@ -1,16 +1,21 @@
 package checkflow
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
+	"time"
 
 	"voice-timeline-renderer/internal/audiocodec"
 	"voice-timeline-renderer/internal/domain"
 	"voice-timeline-renderer/internal/service"
+	"voice-timeline-renderer/internal/storage"
 )
 
 func Run(ctx context.Context, workflow string) error {
@@ -27,6 +32,8 @@ func Run(ctx context.Context, workflow string) error {
 		return runCompose(ctx, harness)
 	case "render-mixdown":
 		return runRender(ctx, harness)
+	case "recover-interrupted-render":
+		return runRecover(ctx, harness)
 	default:
 		return fmt.Errorf("unknown workflow %q", workflow)
 	}
@@ -189,4 +196,202 @@ func runRender(ctx context.Context, harness *Harness) error {
 		return fmt.Errorf("output peak %.3f dBFS does not meet -1 dBFS target", measured.PeakDBFS)
 	}
 	return nil
+}
+
+// runRecover verifies that an interrupted render reaches an explainable
+// terminal state after a service restart while the caller keeps using the
+// original render identifier:
+//   - committed artifacts that prove ownership are adopted without re-mixing,
+//   - disk files that cannot prove ownership are never served as output,
+//   - a queued job resumes through the pipeline,
+//   - only one executor holds the publish qualification at a time.
+func runRecover(ctx context.Context, harness *Harness) error {
+	first, err := sineWAV(48000, 1, 300, 260, 0.3)
+	if err != nil {
+		return err
+	}
+	second, err := sineWAV(44100, 2, 250, 330, 0.25)
+	if err != nil {
+		return err
+	}
+	if _, status, err := harness.createSource(ctx, "source_recover_a", "adopted take", first); err != nil || status != 201 {
+		return fmt.Errorf("adopt source setup failed: status=%d err=%v", status, err)
+	}
+	if _, status, err := harness.createSource(ctx, "source_recover_b", "rebuilt take", second); err != nil || status != 201 {
+		return fmt.Errorf("rebuild source setup failed: status=%d err=%v", status, err)
+	}
+	adoptSpans := []domain.TimelineSpan{
+		{SourceID: "source_recover_a", SourceStartFrame: 0, SourceEndFrame: 14400, GainDB: -2, CrossfadeFrames: 0},
+	}
+	adoptPlan, status, err := harness.createTimeline(ctx, "timeline_recover_adopt", "adopt assembly", 48000, 1, -1, adoptSpans)
+	if err != nil || status != 201 {
+		return fmt.Errorf("adopt timeline setup failed: status=%d err=%v", status, err)
+	}
+	rebuildSpans := []domain.TimelineSpan{
+		{SourceID: "source_recover_b", SourceStartFrame: 0, SourceEndFrame: 11025, GainDB: 0, CrossfadeFrames: 0},
+	}
+	rebuildPlan, status, err := harness.createTimeline(ctx, "timeline_recover_rebuild", "rebuild assembly", 48000, 2, -1, rebuildSpans)
+	if err != nil || status != 201 {
+		return fmt.Errorf("rebuild timeline setup failed: status=%d err=%v", status, err)
+	}
+
+	// Scenario A: the completion confirmation is lost after the artifacts
+	// were committed; the restart must adopt them without re-mixing.
+	adoptJob, status, err := harness.createRender(ctx, "render_recover_adopt", adoptPlan.ID)
+	if err != nil || status != 201 || adoptJob.State != domain.RenderCompleted {
+		return fmt.Errorf("adopt render setup failed: status=%d state=%s err=%v", status, adoptJob.State, err)
+	}
+	adoptReceipt, status, err := harness.getReceipt(ctx, adoptJob.ID)
+	if err != nil || status != 200 {
+		return fmt.Errorf("adopt receipt setup failed: status=%d err=%v", status, err)
+	}
+	repo, err := harness.repository()
+	if err != nil {
+		return err
+	}
+	if err := forceJobState(repo, adoptJob.ID, domain.RenderFinalizing); err != nil {
+		return fmt.Errorf("simulate lost completion: %w", err)
+	}
+	// Re-mixing is impossible once the source media is gone; only adoption
+	// can complete the job.
+	if err := os.Remove(filepath.Join(harness.tempDir, "sources", "source_recover_a", "source.wav")); err != nil {
+		return err
+	}
+	if err := harness.restart(ctx); err != nil {
+		return err
+	}
+	adopted, status, err := harness.getRender(ctx, adoptJob.ID)
+	if err != nil || status != 200 {
+		return fmt.Errorf("adopt read-back failed: status=%d err=%v", status, err)
+	}
+	if adopted.State != domain.RenderCompleted || adopted.Output == nil {
+		return fmt.Errorf("interrupted render was not adopted: state=%s output=%v", adopted.State, adopted.Output)
+	}
+	if adopted.Output.Digest != adoptReceipt.Output.Digest {
+		return fmt.Errorf("adopted output digest %s != original receipt %s", adopted.Output.Digest, adoptReceipt.Output.Digest)
+	}
+	adoptedAudio, status, err := harness.getOutput(ctx, adoptJob.ID)
+	if err != nil || status != 200 {
+		return fmt.Errorf("adopted output unavailable: status=%d err=%v", status, err)
+	}
+	adoptedDigest := sha256.Sum256(adoptedAudio)
+	if hex.EncodeToString(adoptedDigest[:]) != adoptReceipt.Output.Digest {
+		return fmt.Errorf("adopted output bytes do not match the original receipt")
+	}
+	adoptedReceipt, status, err := harness.getReceipt(ctx, adoptJob.ID)
+	if err != nil || status != 200 {
+		return fmt.Errorf("adopted receipt unavailable: status=%d err=%v", status, err)
+	}
+	if !adoptedReceipt.CreatedAt.Equal(adoptReceipt.CreatedAt) || adoptedReceipt.Output.Digest != adoptReceipt.Output.Digest {
+		return fmt.Errorf("original receipt was rewritten during adoption")
+	}
+
+	// Scenario B: files that cannot prove ownership must not become the
+	// successful output; the job is executed again instead.
+	rebuildJob, status, err := harness.createRender(ctx, "render_recover_rebuild", rebuildPlan.ID)
+	if err != nil || status != 201 || rebuildJob.State != domain.RenderCompleted {
+		return fmt.Errorf("rebuild render setup failed: status=%d state=%s err=%v", status, rebuildJob.State, err)
+	}
+	if err := forceJobState(repo, rebuildJob.ID, domain.RenderRendering); err != nil {
+		return fmt.Errorf("simulate interrupted render: %w", err)
+	}
+	foreign := []byte("foreign bytes that cannot prove ownership")
+	if err := os.WriteFile(filepath.Join(harness.tempDir, "renders", rebuildJob.ID, "output.wav"), foreign, 0o640); err != nil {
+		return err
+	}
+	if err := harness.restart(ctx); err != nil {
+		return err
+	}
+	rebuilt, status, err := harness.getRender(ctx, rebuildJob.ID)
+	if err != nil || status != 200 || rebuilt.State != domain.RenderCompleted {
+		return fmt.Errorf("rebuild render did not complete: status=%d state=%s err=%v", status, rebuilt.State, err)
+	}
+	rebuiltAudio, status, err := harness.getOutput(ctx, rebuildJob.ID)
+	if err != nil || status != 200 {
+		return fmt.Errorf("rebuilt output unavailable: status=%d err=%v", status, err)
+	}
+	if bytes.Equal(rebuiltAudio, foreign) {
+		return fmt.Errorf("unowned disk files were served as the render output")
+	}
+	rebuiltReceipt, status, err := harness.getReceipt(ctx, rebuildJob.ID)
+	if err != nil || status != 200 {
+		return fmt.Errorf("rebuilt receipt unavailable: status=%d err=%v", status, err)
+	}
+	rebuiltDigest := sha256.Sum256(rebuiltAudio)
+	if hex.EncodeToString(rebuiltDigest[:]) != rebuiltReceipt.Output.Digest {
+		return fmt.Errorf("rebuilt output bytes do not match the rebuilt receipt")
+	}
+	quarantined, err := filepath.Glob(filepath.Join(harness.tempDir, "tmp", "quarantine-"+rebuildJob.ID+"-*"))
+	if err != nil || len(quarantined) != 1 {
+		return fmt.Errorf("unowned artifacts were not quarantined: matches=%d err=%v", len(quarantined), err)
+	}
+
+	// Scenario C: a job that never started resumes through the pipeline
+	// under its original identifier.
+	repo, err = harness.repository()
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	queuedJob := domain.RenderJob{
+		ID:         "render_recover_queued",
+		TimelineID: rebuildPlan.ID,
+		State:      domain.RenderQueued,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	if err := repo.SaveJob(queuedJob); err != nil {
+		return fmt.Errorf("inject queued job: %w", err)
+	}
+	if err := harness.restart(ctx); err != nil {
+		return err
+	}
+	resumed, status, err := harness.getRender(ctx, queuedJob.ID)
+	if err != nil || status != 200 || resumed.State != domain.RenderCompleted {
+		return fmt.Errorf("queued job did not resume: status=%d state=%s err=%v", status, resumed.State, err)
+	}
+	if _, status, err := harness.getOutput(ctx, queuedJob.ID); err != nil || status != 200 {
+		return fmt.Errorf("resumed output unavailable: status=%d err=%v", status, err)
+	}
+
+	// Scenario D: while another executor holds the lease, a same-identifier
+	// request only observes the job; once released, the request resumes it.
+	if err := forceJobState(repo, queuedJob.ID, domain.RenderRendering); err != nil {
+		return fmt.Errorf("simulate in-flight render: %w", err)
+	}
+	release, acquired, err := repo.AcquireRenderLease(queuedJob.ID, "competing-executor", time.Minute, false)
+	if err != nil || !acquired {
+		return fmt.Errorf("competing executor could not acquire the lease: acquired=%v err=%v", acquired, err)
+	}
+	blocked, status, err := harness.createRender(ctx, queuedJob.ID, rebuildPlan.ID)
+	if err != nil || status != 200 {
+		return fmt.Errorf("same-identifier request failed: status=%d err=%v", status, err)
+	}
+	if blocked.State != domain.RenderRendering {
+		return fmt.Errorf("same-identifier request did not observe the in-flight job: state=%s", blocked.State)
+	}
+	if err := release(); err != nil {
+		return fmt.Errorf("release competing lease: %w", err)
+	}
+	finished, status, err := harness.createRender(ctx, queuedJob.ID, rebuildPlan.ID)
+	if err != nil || status != 200 || finished.State != domain.RenderCompleted {
+		return fmt.Errorf("released render did not resume: status=%d state=%s err=%v", status, finished.State, err)
+	}
+	return nil
+}
+
+// forceJobState rewrites the persisted state of a render job to simulate an
+// interrupted process. Forcing an active state drops the completion metadata
+// that a real interruption would not have persisted yet.
+func forceJobState(repo *storage.Repository, id string, state domain.RenderState) error {
+	job, err := repo.GetJob(id)
+	if err != nil {
+		return err
+	}
+	job.State = state
+	if state != domain.RenderCompleted && state != domain.RenderFailed {
+		job.Output = nil
+		job.ReceiptDigest = ""
+	}
+	return repo.SaveJob(job)
 }

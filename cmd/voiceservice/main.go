@@ -31,6 +31,10 @@ func main() {
 		os.Exit(1)
 	}
 	serviceLayer := service.New(repo, service.DefaultConfig())
+	if err := serviceLayer.RecoverRenders(context.Background()); err != nil {
+		slog.Error("render recovery failed", "error", err)
+		os.Exit(1)
+	}
 	api := httpapi.New(serviceLayer, httpapi.Options{
 		MaxSourceRequestBytes: 48 << 20,
 		MaxJSONBytes:          2 << 20,
